@@ -1120,6 +1120,29 @@ class MegatronNativeEngine(MegatronBaseEngine):
             mbs.append({"rows": [rows[j] for j in bin_rows], "ids_list": ids_list})
         return mbs
 
+    def _token_align(self) -> int:
+        """LCM of every token-count divisibility this run requires.
+
+        RL sequence lengths are whatever the rollout produced, so each of these
+        has to be padded for rather than assumed:
+          * sequence parallelism (required for MoE+TP) scatters the packed
+            sequence across TP ranks, so it must be a multiple of TP;
+          * DSv4's compressor asserts ``seqlen % ratio == 0`` every forward, and
+            under CP additionally ``seqlen % (ratio*2) == 0``;
+          * TE refuses an unaligned activation under FP8
+            (``assert_dim_for_fp8_exec``). Pretraining never trips this because
+            its ``[seq, mbs]`` is fixed.
+        """
+        align = self._tp if (self._sp and self._tp > 1) else 1
+        if self._spec is not None and self._spec.sequence_alignment is not None:
+            align = math.lcm(align, self._dsv4_align * (2 if self._cp > 1 else 1))
+        if getattr(self._tfcfg, "fp8", None):
+            # Megatron's own size, so mxfp8's 32 is covered rather than just 16.
+            from megatron.core.fp8_utils import get_fp8_align_size
+
+            align = math.lcm(align, get_fp8_align_size(self._tfcfg.fp8_recipe))
+        return align
+
     def _pp_forward_model(self, model, ids_list):
         """Pack full sequences into this rank's ``thd`` token stream.
 
@@ -1151,23 +1174,9 @@ class MegatronNativeEngine(MegatronBaseEngine):
 
         cp_rank = mpu.get_context_parallel_rank()
 
-        # Token-count alignment, computed BEFORE the CP split because under the
-        # contiguous layout the per-rank chunk itself has to be aligned.
-        #   * sequence parallelism (required for MoE+TP) scatters the packed
-        #     sequence across TP ranks, so it must be a multiple of TP;
-        #   * DSv4's compressor asserts ``seqlen % ratio == 0`` on every forward,
-        #     and under CP additionally ``seqlen % (ratio*2) == 0``, while RL
-        #     sequence lengths are whatever the rollout produced.
-        align = self._tp if (self._sp and self._tp > 1) else 1
-        if self._spec.sequence_alignment is not None:
-            align = math.lcm(align, self._dsv4_align * (2 if self._cp > 1 else 1))
-        if getattr(self._tfcfg, "fp8", None):
-            # TE refuses an unaligned token count outright (assert_dim_for_fp8_exec).
-            # Pretraining never trips this because its [seq, mbs] is fixed; an RL
-            # token count is whatever the rollout produced.
-            from megatron.core.fp8_utils import get_fp8_align_size
-
-            align = math.lcm(align, get_fp8_align_size(self._tfcfg.fp8_recipe))
+        # Computed BEFORE the CP split: under the contiguous layout the per-rank
+        # chunk itself has to be aligned.
+        align = self._token_align()
 
         cp_contiguous = self._caps.packed_stream_is_single_sequence and self._cp > 1
         if cp_contiguous and len(ids_list) > 1:
