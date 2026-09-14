@@ -222,6 +222,37 @@ class MegatronNativeEngine(MegatronBaseEngine):
         )
         return megatron_fp8_kwargs(cfg, num_layers=num_layers, pp_size=pp)
 
+    @staticmethod
+    def _check_fp8_usable(fp8_kwargs: dict, tfcfg) -> None:
+        """Refuse an FP8 request this run cannot actually honour.
+
+        Two ways it cannot, both of which otherwise surface late and wrong:
+        a ``build_config`` family builds its own config and never receives
+        fp8_kwargs, so the run would train in BF16 while reporting FP8; and TE
+        only resolves the recipe at the first forward, so an unsupported one
+        (blockwise has no ROCm GEMM as of TE 2.15) kills the run minutes in.
+        """
+        if not getattr(tfcfg, "fp8", None):
+            raise RuntimeError(
+                f"FP8 was requested (fp8={fp8_kwargs.get('fp8')}, "
+                f"fp8_recipe={fp8_kwargs.get('fp8_recipe')}) but the "
+                f"{type(tfcfg).__name__} built for this model family does not carry "
+                f"it; that path would train in BF16. FP8 is only wired for the "
+                f"generic TransformerConfig path."
+            )
+        try:
+            from megatron.core.fp8_utils import get_fp8_recipe
+            from transformer_engine.pytorch.quantization import check_recipe_support
+        except ImportError:
+            return  # best-effort: TE still raises at the first forward
+        try:
+            check_recipe_support(get_fp8_recipe(tfcfg))
+        except (RuntimeError, ValueError) as e:
+            raise RuntimeError(
+                f"fp8_recipe={fp8_kwargs.get('fp8_recipe')!r} is not usable on this "
+                f"build: {e}"
+            ) from e
+
     @property
     def _caps(self):
         """Capabilities of the resolved family, or the defaults pre-``initialize``."""
@@ -495,22 +526,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
         self._tfcfg = tfcfg
 
         if fp8_kwargs:
-            # TE resolves the recipe at the first forward, so an unsupported one
-            # (blockwise has no ROCm GEMM as of TE 2.15) kills the run minutes in.
-            # Ask up front, via Megatron's own string -> recipe mapping.
-            try:
-                from megatron.core.fp8_utils import get_fp8_recipe
-                from transformer_engine.pytorch.quantization import check_recipe_support
-            except ImportError:
-                pass  # best-effort: TE still raises at the first forward
-            else:
-                try:
-                    check_recipe_support(get_fp8_recipe(tfcfg))
-                except RuntimeError as e:
-                    raise RuntimeError(
-                        f"fp8_recipe={fp8_kwargs.get('fp8_recipe')!r} is not usable on "
-                        f"this build: {e}"
-                    ) from e
+            self._check_fp8_usable(fp8_kwargs, tfcfg)
             if self._rank() == 0:
                 # print, not logger: Ray forwards worker stdout, not log records.
                 print(
@@ -1143,6 +1159,23 @@ class MegatronNativeEngine(MegatronBaseEngine):
             align = math.lcm(align, get_fp8_align_size(self._tfcfg.fp8_recipe))
         return align
 
+    @staticmethod
+    def _packed_max_seqlen(local_offsets, cp: int) -> int:
+        """``max_seqlen`` for PackedSeqParams: every cu_seqlens bin, pad included.
+
+        Megatron sizes the RoPE table from this (``get_rotary_seq_len``), then
+        ``_apply_rotary_pos_emb_thd`` slices ``freqs[:len]`` per bin. A trailing
+        pad bin longer than ``max_seqlen`` therefore gets a short slice, and the
+        packed freqs come out shorter than the activation. It only bites when
+        the pad exceeds every real sequence, so a microbatch of short sequences
+        is what exposes it.
+        """
+        bins = [
+            (local_offsets[i + 1] - local_offsets[i]) * cp
+            for i in range(len(local_offsets) - 1)
+        ]
+        return max(bins) if bins else 0
+
     def _pp_forward_model(self, model, ids_list):
         """Pack full sequences into this rank's ``thd`` token stream.
 
@@ -1266,22 +1299,21 @@ class MegatronNativeEngine(MegatronBaseEngine):
             # not, so log the ratio once (rank 0) rather than leave it invisible.
             if not getattr(self, "_pad_logged", False) and self._rank() == 0:
                 real = local_total - pad
-                logger.info(
-                    "MegatronNativeEngine forward pad: align=%d (+%d/%d tokens, %.2f%%) "
-                    "per microbatch; worst case (align-1)/tokens=%.2f%%",
-                    align, pad, local_total, 100.0 * pad / max(1, local_total),
-                    100.0 * (align - 1) / max(1, real),
+                # print, not logger: Ray forwards worker stdout, not log records.
+                print(
+                    f"[MegatronNativeEngine] forward pad: align={align} "
+                    f"(+{pad}/{local_total} tokens, "
+                    f"{100.0 * pad / max(1, local_total):.2f}%) per microbatch; "
+                    f"worst case (align-1)/tokens="
+                    f"{100.0 * (align - 1) / max(1, real):.2f}%",
+                    flush=True,
                 )
                 self._pad_logged = True
         tokens = torch.cat(local_ids, dim=0).view(1, local_total)
         # For RoPE + packed thd, Megatron derives positions from cu_seqlens and
         # CP rank; explicit position_ids are neither needed nor consumed.
         cu = torch.tensor(local_offsets, dtype=torch.int32, device=tokens.device) * self._cp
-        full_lens = [
-            (local_offsets[i + 1] - local_offsets[i]) * self._cp
-            for i in range(len(ids_list))
-        ]
-        mx = max(full_lens) if full_lens else 0
+        mx = self._packed_max_seqlen(local_offsets, self._cp)
         psp = PackedSeqParams(
             cu_seqlens_q=cu,
             cu_seqlens_kv=cu,
