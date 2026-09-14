@@ -169,6 +169,27 @@ class MegatronBaseEngine(BaseEngine):
         logits = out.logits if hasattr(out, "logits") else out
         return logits.view(L, -1).float()
 
+    def _packed_token_align(self) -> int:
+        """Token-count divisibility the packed stream must satisfy. 1 = none.
+
+        Overridden where the run imposes one (FP8, sequence parallelism, DSv4).
+        """
+        return 1
+
+    @staticmethod
+    def _packed_max_seqlen(offsets, cp: int = 1) -> int:
+        """``max_seqlen`` for PackedSeqParams: every cu_seqlens bin, pad included.
+
+        Megatron sizes the RoPE table from this (``get_rotary_seq_len``), then
+        ``_apply_rotary_pos_emb_thd`` slices ``freqs[:len]`` per bin. A trailing
+        pad bin longer than ``max_seqlen`` therefore gets a short slice, and the
+        packed freqs come out shorter than the activation.
+        """
+        bins = [
+            (offsets[i + 1] - offsets[i]) * cp for i in range(len(offsets) - 1)
+        ]
+        return max(bins) if bins else 0
+
     def _forward_logits_packed(self, ids_list, model=None) -> tuple[torch.Tensor, list[int]]:
         """Packed varlen forward: concat ``ids_list`` (per-sequence 1D token tensors)
         into one [1,T] stream and run a single GPTModel forward with thd
@@ -185,18 +206,35 @@ class MegatronBaseEngine(BaseEngine):
         for L in lens:
             offsets.append(offsets[-1] + L)
         T = offsets[-1]
-        tokens = torch.cat([t.view(-1) for t in ids_list], dim=0).view(1, T)
+        # A trailing pad segment when the run needs an aligned token count (FP8
+        # refuses leading dims indivisible by 8). It gets its own cu_seqlens bin,
+        # so attention stays isolated, and ``offsets`` keeps naming only the real
+        # sequences -- callers slice by those and never see the pad.
+        align = self._packed_token_align()
+        pad = (-T) % align if align > 1 else 0
+        bin_offsets = offsets + [T + pad] if pad else offsets
+        seg_lens = lens + [pad] if pad else lens
+        total = T + pad
+        tokens = torch.cat(
+            [t.view(-1) for t in ids_list]
+            + ([torch.zeros(pad, dtype=ids_list[0].dtype, device=ids_list[0].device)]
+               if pad else []),
+            dim=0,
+        ).view(1, total)
         # per-segment position ids (0..L_i-1); ignored by thd rotary but kept correct.
-        pos = torch.cat([torch.arange(L, device=tokens.device) for L in lens], dim=0).view(1, T)
-        cu = torch.tensor(offsets, dtype=torch.int32, device=tokens.device)
-        max_seqlen = max(lens) if lens else 0
+        pos = torch.cat(
+            [torch.arange(L, device=tokens.device) for L in seg_lens], dim=0
+        ).view(1, total)
+        cu = torch.tensor(bin_offsets, dtype=torch.int32, device=tokens.device)
+        max_seqlen = self._packed_max_seqlen(bin_offsets)
         pp = PackedSeqParams(
             cu_seqlens_q=cu, cu_seqlens_kv=cu,
             max_seqlen_q=max_seqlen, max_seqlen_kv=max_seqlen, qkv_format="thd",
         )
         out = m(input_ids=tokens, position_ids=pos, attention_mask=None, packed_seq_params=pp)
         logits = out.logits if hasattr(out, "logits") else out
-        return logits.view(T, -1).float(), offsets
+        # Drop the pad tail: offsets addresses the real sequences only.
+        return logits.view(total, -1)[:T].float(), offsets
 
     def _build_bins(self, lengths: list[int], budget: int) -> list[list[int]]:
         """Greedy bin-packing of row indices into groups whose summed token length

@@ -1136,6 +1136,10 @@ class MegatronNativeEngine(MegatronBaseEngine):
             mbs.append({"rows": [rows[j] for j in bin_rows], "ids_list": ids_list})
         return mbs
 
+    def _packed_token_align(self) -> int:
+        """The base packed forward (dense, pp=cp=1) needs the same alignment."""
+        return self._token_align()
+
     def _token_align(self) -> int:
         """LCM of every token-count divisibility this run requires.
 
@@ -1158,23 +1162,6 @@ class MegatronNativeEngine(MegatronBaseEngine):
 
             align = math.lcm(align, get_fp8_align_size(self._tfcfg.fp8_recipe))
         return align
-
-    @staticmethod
-    def _packed_max_seqlen(local_offsets, cp: int) -> int:
-        """``max_seqlen`` for PackedSeqParams: every cu_seqlens bin, pad included.
-
-        Megatron sizes the RoPE table from this (``get_rotary_seq_len``), then
-        ``_apply_rotary_pos_emb_thd`` slices ``freqs[:len]`` per bin. A trailing
-        pad bin longer than ``max_seqlen`` therefore gets a short slice, and the
-        packed freqs come out shorter than the activation. It only bites when
-        the pad exceeds every real sequence, so a microbatch of short sequences
-        is what exposes it.
-        """
-        bins = [
-            (local_offsets[i + 1] - local_offsets[i]) * cp
-            for i in range(len(local_offsets) - 1)
-        ]
-        return max(bins) if bins else 0
 
     def _pp_forward_model(self, model, ids_list):
         """Pack full sequences into this rank's ``thd`` token stream.
