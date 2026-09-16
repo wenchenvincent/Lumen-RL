@@ -1677,6 +1677,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
             )
 
         _mem_diag_end("update")
+        self._nan_scan(losses)
         update_successful, grad_norm, _ = self.optimizer.step()
         _mem_diag_end("update+optstep")
         if not update_successful:
