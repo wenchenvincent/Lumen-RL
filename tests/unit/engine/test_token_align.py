@@ -48,12 +48,28 @@ def test_dsv4_align_ignored_when_the_family_declares_no_alignment():
     assert _engine(dsv4_align=128, has_spec_align=False)._token_align() == 1
 
 
-@pytest.mark.parametrize("recipe,expected", [
-    ("tensorwise", 16), ("delayed", 16), ("blockwise", 16), ("mxfp8", 32),
-])
-def test_fp8_imposes_megatrons_alignment_per_recipe(recipe, expected):
+@pytest.mark.parametrize("recipe", ["tensorwise", "delayed", "blockwise", "mxfp8"])
+def test_fp8_imposes_megatrons_alignment_per_recipe(recipe):
+    """The size must come from Megatron, not a literal.
+
+    The two disagree: mxfp8 is 32 on NVIDIA upstream and 128 on the ROCm fork,
+    so a hardcoded number is wrong on one of them. Asserting against
+    get_fp8_align_size still fails if the engine hardcodes 16, because that
+    differs from what Megatron reports for mxfp8 either way.
+    """
+    from megatron.core.fp8_utils import get_fp8_align_size
+
     e = _engine(fp8="e4m3", fp8_recipe=recipe)
-    assert e._token_align() == expected
+    assert e._token_align() == get_fp8_align_size(recipe)
+
+
+def test_mxfp8_needs_a_coarser_alignment_than_the_others():
+    from megatron.core.fp8_utils import get_fp8_align_size
+
+    assert get_fp8_align_size("mxfp8") > get_fp8_align_size("tensorwise")
+    assert _engine(fp8="e4m3", fp8_recipe="mxfp8")._token_align() > _engine(
+        fp8="e4m3", fp8_recipe="tensorwise"
+    )._token_align()
 
 
 def test_bf16_run_is_unaffected_by_a_stale_recipe_field():
@@ -62,11 +78,18 @@ def test_bf16_run_is_unaffected_by_a_stale_recipe_field():
 
 
 def test_requirements_combine_as_an_lcm_not_a_max():
+    import math
+
+    from megatron.core.fp8_utils import get_fp8_align_size
+
     # TP=8 and fp8=16 -> 16; adding DSv4's 128 subsumes both.
     assert _engine(tp=8, sp=True, fp8="e4m3")._token_align() == 16
-    assert _engine(tp=8, sp=True, fp8="e4m3", fp8_recipe="mxfp8")._token_align() == 32
+    mx = get_fp8_align_size("mxfp8")
+    assert _engine(tp=8, sp=True, fp8="e4m3", fp8_recipe="mxfp8")._token_align() == (
+        math.lcm(8, mx)
+    )
     e = _engine(tp=8, sp=True, fp8="e4m3", dsv4_align=128, has_spec_align=True)
-    assert e._token_align() == 128
+    assert e._token_align() == math.lcm(128, get_fp8_align_size("tensorwise"))
 
 
 def test_a_coprime_pair_multiplies_rather_than_dropping_one():

@@ -287,7 +287,6 @@ def test_export_uses_the_mla_bridge_and_includes_the_router_bias():
     seen = {}
 
     class FakeEngine:
-        module = object()
         _dims = None
 
         def _full_megatron_named_params_moe(self):
@@ -297,20 +296,156 @@ def test_export_uses_the_mla_bridge_and_includes_the_router_bias():
         def _full_megatron_named_params(self):
             raise AssertionError("DSv3 must use the MoE gather")
 
-    import lumenrl.engine.training.model_specs as ms
+        def _router_bias_buffers(self):
+            seen["bias"] = "engine"
+            return iter(())
 
-    orig = dsv3.dsv3_router_bias_buffers
-    try:
-        dsv3.dsv3_router_bias_buffers = lambda mod: iter(())  # type: ignore[assignment]
-        ms.dsv3.dsv3_router_bias_buffers = dsv3.dsv3_router_bias_buffers
-        list(spec.export_weights(FakeEngine()))
-    finally:
-        dsv3.dsv3_router_bias_buffers = orig  # type: ignore[assignment]
-        ms.dsv3.dsv3_router_bias_buffers = orig
+        @property
+        def module(self):
+            # The bridge's raw walker takes the module and skips the global
+            # renumbering and PP broadcast, so reaching for it is the bug.
+            raise AssertionError("DSv3 must not walk named_buffers() directly")
+
+    list(spec.export_weights(FakeEngine()))
 
     assert seen["gather"] == "moe"
+    assert seen["bias"] == "engine"
 
 
 def test_dsv3_uses_the_stock_te_layer_spec():
     """MLA is a parameter of the stock builder, so no custom spec is needed."""
     assert MODEL_REGISTRY.resolve(K2, {}).build_layer_spec is None
+
+
+# --- unsupported variants and dropped engine_config knobs -------------------
+
+def test_a_missing_q_lora_rank_is_refused_not_coerced_to_zero():
+    """Megatron branches on ``q_lora_rank is None``, so ``or 0`` is not a no-op.
+
+    Coercing takes the LoRA branch and builds a rank-0 projection; separately
+    the bridge has no ``linear_q_proj`` mapping, so the non-LoRA q projection
+    would be dropped from the weight sync silently. Both are quiet failures.
+    """
+    no_lora = {k: v for k, v in K2.items() if k != "q_lora_rank"}
+    with pytest.raises(ValueError, match="q_lora_rank"):
+        dsv3.build_dsv3_config(no_lora, {})
+
+
+def test_an_explicit_null_q_lora_rank_is_refused_too():
+    # DeepSeek-V2-Lite ships `"q_lora_rank": null`, so this is the real spelling.
+    with pytest.raises(ValueError, match="q_lora_rank"):
+        dsv3.build_dsv3_config({**K2, "q_lora_rank": None}, {})
+
+
+def test_a_zero_q_lora_rank_is_refused():
+    # 0 is not None, so Megatron would take the LoRA branch at rank 0.
+    with pytest.raises(ValueError, match="q_lora_rank"):
+        dsv3.build_dsv3_config({**K2, "q_lora_rank": 0}, {})
+
+
+def test_the_dims_builder_refuses_it_as_well():
+    """``build_dims`` is its own spec hook, reachable without ``build_config``."""
+    with pytest.raises(ValueError, match="q_lora_rank"):
+        dsv3.build_dsv3_dims({**K2, "q_lora_rank": None})
+
+
+def test_a_real_q_lora_rank_still_passes_through():
+    assert dsv3.build_dsv3_config(K2, {}).q_lora_rank == 1536
+    assert dsv3.build_dsv3_dims(K2).q_lora_rank == 1536
+
+
+def test_shared_expert_size_honours_the_engine_config_override():
+    """The generic path honours this; building in the bridge must not drop it."""
+    cfg = dsv3.build_dsv3_config(K2, {"moe_shared_expert_intermediate_size": 4096})
+    assert cfg.moe_shared_expert_intermediate_size == 4096
+
+
+def test_shared_expert_size_falls_back_to_the_hf_derived_value():
+    cfg = dsv3.build_dsv3_config(K2, {})
+    assert cfg.moe_shared_expert_intermediate_size == 2048 * 1  # moe_ffn * n_shared
+
+
+# --- one dispatcher decision, shared with the generic path ------------------
+
+def _megatron_has_mori() -> bool:
+    """This image's Megatron 0.18.2 has moe_flex_dispatcher_backend but not the
+    MORI heap field, so the flex path needs a Megatron built with MORI support.
+    The generic path in megatron_native_engine fails identically without it --
+    DSv3 mirrors that rather than diverging."""
+    import dataclasses
+
+    from megatron.core.transformer.transformer_config import MLATransformerConfig
+
+    return any(
+        f.name == "moe_mori_max_tokens_per_rank"
+        for f in dataclasses.fields(MLATransformerConfig)
+    )
+
+
+def test_the_dispatcher_defaults_to_alltoall_as_before():
+    assert dsv3.build_dsv3_config(K2, {}).moe_token_dispatcher_type == "alltoall"
+
+
+def test_the_dispatcher_is_taken_from_engine_config_not_hardcoded():
+    """DSv3 was the one MoE family whose dispatcher could not be selected.
+
+    ``allgather`` is used here only because every Megatron build accepts it at
+    pp=1 (variable_seq_lengths is False there, so upstream's rejection of it
+    does not apply); the point under test is that the override reaches the
+    config at all, not this particular dispatcher.
+    """
+    cfg = dsv3.build_dsv3_config(K2, {"moe_token_dispatcher_type": "allgather"})
+    assert cfg.moe_token_dispatcher_type == "allgather"
+
+
+def test_the_heap_budget_is_no_longer_discarded():
+    """``max_tokens_per_gpu`` used to be ``del``-ed; it sizes the MORI heap.
+
+    Asserted on the shared helper, which is where the arithmetic lives and
+    which does not need a MORI-capable Megatron to exercise.
+    """
+    from lumenrl.engine.training.megatron_base_engine import moe_dispatcher_kwargs
+
+    kw = moe_dispatcher_kwargs(
+        {"moe_token_dispatcher_type": "flex"},
+        tp=2, cp=2, sp=True, max_tokens_per_gpu=8192,
+    )
+    assert kw["moe_mori_max_tokens_per_rank"] == 2048  # 8192 / cp=2 / tp=2
+
+
+@pytest.mark.skipif(not _megatron_has_mori(), reason="Megatron built without MORI")
+def test_flex_reaches_the_config_on_a_mori_capable_megatron():
+    cfg = dsv3.build_dsv3_config(
+        K2, {"moe_token_dispatcher_type": "flex"}, max_tokens_per_gpu=8192
+    )
+    assert cfg.moe_token_dispatcher_type == "flex"
+    assert cfg.moe_flex_dispatcher_backend == "mori"
+    assert cfg.moe_mori_max_tokens_per_rank == 8192
+
+
+def test_the_parallel_layout_and_budget_reach_the_shared_helper(monkeypatch):
+    """``build_dsv3_config`` must forward its own arguments, not placeholders.
+
+    Observed at the collaborator rather than on the built config because this
+    Megatron cannot construct a flex config at all (no MORI heap field), so the
+    forwarded budget is invisible in the result. The helper's return value is
+    irrelevant here -- only the call it receives is under test.
+    """
+    from lumenrl.engine.training import megatron_base_engine as mbe
+
+    seen = {}
+
+    def _spy(engine_config, *, tp, cp, sp, max_tokens_per_gpu=0):
+        seen.update(ec=dict(engine_config), tp=tp, cp=cp, sp=sp,
+                    max_tokens_per_gpu=max_tokens_per_gpu)
+        return {"moe_token_dispatcher_type": "alltoall"}
+
+    monkeypatch.setattr(mbe, "moe_dispatcher_kwargs", _spy)
+    dsv3.build_dsv3_config(
+        K2, {"moe_token_dispatcher_type": "flex"},
+        tp=2, cp=4, sp=True, max_tokens_per_gpu=8192,
+    )
+
+    assert seen["tp"] == 2 and seen["cp"] == 4 and seen["sp"] is True
+    assert seen["max_tokens_per_gpu"] == 8192, "the heap budget was dropped again"
+    assert seen["ec"]["moe_token_dispatcher_type"] == "flex"
